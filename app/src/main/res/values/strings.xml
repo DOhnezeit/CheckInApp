@@ -1,3 +1,5 @@
 <resources>
     <string name="app_name">CheckInApp</string>
+    <string name="channel_name">Check-in Notifications</string>
+    <string name="channel_description">Notifications about check-ins</string>
 </resources>
