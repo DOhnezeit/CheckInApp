@@ -6,9 +6,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.layout.*
 import androidx.compose.material3.*
-import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
-import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Context
 import android.Manifest
@@ -20,17 +18,12 @@ import android.util.Log
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.lifecycle.lifecycleScope
-import com.google.firebase.messaging.FirebaseMessaging
 import com.google.firebase.Firebase
 import com.google.firebase.messaging.messaging
 import com.dohnezeit.checkinapp.ui.theme.CheckInAppTheme
-import com.dohnezeit.checkinapp.MainScreen
-import com.dohnezeit.checkinapp.PreferencesManager
 import androidx.core.content.edit
-import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.firstOrNull
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
 
 class MainActivity : ComponentActivity() {
@@ -51,86 +44,11 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
 
         preferencesManager = PreferencesManager(this)
-        createNotificationChannels()
+        NotificationHelper.createNotificationChannels(this)
         askNotificationPermission()
 
-        // 🔥 FORCE TOKEN REFRESH
-        lifecycleScope.launch {
-            try {
-                Log.d(TAG, "🔄 Deleting old FCM token...")
-                Firebase.messaging.deleteToken().await()
-
-                Log.d(TAG, "⏳ Waiting for new token generation...")
-                delay(2000)
-
-                val newToken = Firebase.messaging.token.await()
-                Log.d(TAG, "🔥🔥🔥 NEW FCM TOKEN GENERATED 🔥🔥🔥")
-                Log.d(TAG, "Token: $newToken")
-                Log.d(TAG, "🔥🔥🔥 TEST THIS TOKEN IN FIREBASE CONSOLE 🔥🔥🔥")
-
-                // Store token locally
-                getSharedPreferences("fcm", Context.MODE_PRIVATE).edit {
-                    putString("token", newToken)
-                }
-
-                // Auto-register the new token with server
-                val userId = preferencesManager.userId.first()
-                val checkerId = preferencesManager.checkerId.first()
-                val apiKey = preferencesManager.apiKey.first()
-
-                if (apiKey.isNullOrBlank()) {
-                    Log.w(TAG, "⚠️ API key not set yet, token will be registered after setup")
-                    return@launch
-                }
-
-                RetrofitClient.setApiKey(apiKey)
-                val api = RetrofitClient.create()
-
-                // Register as checker if userId is set
-                if (!userId.isNullOrBlank()) {
-                    try {
-                        val response = api.registerChecker(
-                            request = RegisterCheckerRequest(
-                                checker_id = userId,
-                                checker_token = newToken
-                            )
-                        )
-                        if (response.isSuccessful) {
-                            Log.d(TAG, "✅ NEW checker token registered successfully")
-                        } else {
-                            Log.e(TAG, "❌ Checker registration failed: ${response.code()}")
-                        }
-                    } catch (e: Exception) {
-                        Log.e(TAG, "❌ Failed to register checker", e)
-                    }
-                }
-
-                // Register as watcher if watching someone
-                if (!checkerId.isNullOrBlank() && !userId.isNullOrBlank()) {
-                    try {
-                        val response = api.registerWatcher(
-                            request = RegisterWatcherRequest(
-                                checker_id = checkerId,
-                                watcher_id = userId,
-                                watcher_token = newToken
-                            )
-                        )
-                        if (response.isSuccessful) {
-                            Log.d(TAG, "✅ NEW watcher token registered successfully")
-                        } else {
-                            Log.e(TAG, "❌ Watcher registration failed: ${response.code()}")
-                        }
-                    } catch (e: Exception) {
-                        Log.e(TAG, "❌ Failed to register watcher", e)
-                    }
-                }
-
-            } catch (e: Exception) {
-                Log.e(TAG, "❌ Token refresh failed: ${e.message}", e)
-                // Fallback to old method
-                getOldToken()
-            }
-        }
+        // Get initial FCM token
+        getInitialToken()
 
         setContent {
             CheckInAppTheme {
@@ -143,19 +61,55 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        handleAlarmIntent(intent)
+        // Handle FCM data from intent (when app opened from background via data-only message)
+        handleFCMIntent(intent)
     }
 
     override fun onNewIntent(intent: Intent?) {
         super.onNewIntent(intent)
-        intent?.let { handleAlarmIntent(it) }
+        Log.d(TAG, "onNewIntent called")
+        intent?.let { handleFCMIntent(it) }
     }
 
-    private fun handleAlarmIntent(intent: Intent) {
+    private fun handleFCMIntent(intent: Intent) {
+        Log.d(TAG, "handleFCMIntent - checking for FCM data")
+
+        // Log all extras for debugging
+        intent.extras?.let { bundle ->
+            Log.d(TAG, "Intent extras keys: ${bundle.keySet().joinToString()}")
+            for (key in bundle.keySet()) {
+                Log.d(TAG, "  $key = ${bundle.get(key)}")
+            }
+        }
+
+        // Check for alarm acknowledgment flag
         if (intent.getBooleanExtra("acknowledge_alarm", false)) {
             val checkerId = intent.getStringExtra("checker_id")
             if (checkerId != null) {
+                Log.d(TAG, "Alarm acknowledgment requested for $checkerId")
                 acknowledgeAlarm(checkerId)
+                return
+            }
+        }
+
+        // Extract FCM data payload from intent extras
+        // When a data-only message is received in background, FCM puts the data in extras
+        val type = intent.getStringExtra("type")
+        val checkerId = intent.getStringExtra("checker_id")
+        val title = intent.getStringExtra("title")
+        val body = intent.getStringExtra("body")
+        val isAlarmLoop = intent.getStringExtra("alarm_loop") == "true"
+
+        if (type != null) {
+            Log.d(TAG, "FCM data received from intent: type=$type, checkerId=$checkerId")
+
+            // With notification payload, onMessageReceived() is always called
+            // So we don't need to create notifications here - just handle user actions
+
+            // Handle alarm acknowledgment if app was opened by tapping notification
+            if (type == "alarm" && intent.getBooleanExtra("acknowledge_alarm", false)) {
+                Log.d(TAG, "Auto-acknowledging alarm from notification tap")
+                checkerId?.let { acknowledgeAlarm(it) }
             }
         }
     }
@@ -172,79 +126,75 @@ class MainActivity : ComponentActivity() {
 
                     // Clear the notification
                     val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-                    notificationManager.cancel(1001)
+                    notificationManager.cancel(NotificationHelper.ALARM_NOTIFICATION_ID)
 
                     Toast.makeText(this@MainActivity, "Alarm acknowledged", Toast.LENGTH_SHORT).show()
+                    Log.d(TAG, "✅ Alarm acknowledged from MainActivity")
                 }
             } catch (e: Exception) {
-                Log.e("MainActivity", "Failed to acknowledge alarm: ${e.message}", e)
+                Log.e(TAG, "Failed to acknowledge alarm: ${e.message}", e)
                 Toast.makeText(this@MainActivity, "Failed to acknowledge alarm", Toast.LENGTH_SHORT).show()
             }
         }
     }
 
-    private fun getOldToken() {
-        FirebaseMessaging.getInstance().token.addOnCompleteListener { task ->
-            if (task.isSuccessful) {
-                val token = task.result
-                Log.d(TAG, "Fallback FCM Token: $token")
+    private fun getInitialToken() {
+        lifecycleScope.launch {
+            try {
+                val token = Firebase.messaging.token.await()
+                Log.d(TAG, "📱 Initial FCM Token: ${token.take(20)}...")
 
+                // Store token locally
                 getSharedPreferences("fcm", Context.MODE_PRIVATE).edit {
                     putString("token", token)
                 }
 
-                lifecycleScope.launch {
-                    val userId = preferencesManager.userId.first()
-                    val checkerId = preferencesManager.checkerId.first()
-                    val apiKey = preferencesManager.apiKey.first()
+                // Register with server if user is already logged in
+                val userId = preferencesManager.userId.firstOrNull()
+                val checkerId = preferencesManager.checkerId.firstOrNull()
+                val apiKey = preferencesManager.apiKey.firstOrNull()
+                val role = preferencesManager.userRole.firstOrNull()  // <-- ADD THIS
 
-                    if (apiKey.isNullOrBlank()) {
-                        Log.w(TAG, "API key not set yet, skipping token registration")
-                        return@launch
-                    }
-
+                if (!apiKey.isNullOrBlank() && !userId.isNullOrBlank() && !role.isNullOrBlank()) {
                     RetrofitClient.setApiKey(apiKey)
                     val api = RetrofitClient.create()
 
-                    if (!userId.isNullOrBlank()) {
+                    // Only register as checker if role is "checker"
+                    if (role == "checker") {  // <-- ADD THIS CHECK
                         try {
                             val response = api.registerChecker(
-                                request = RegisterCheckerRequest(
+                                RegisterCheckerRequest(
                                     checker_id = userId,
                                     checker_token = token
                                 )
                             )
                             if (response.isSuccessful) {
-                                Log.d(TAG, "✅ Checker token registered successfully")
-                            } else {
-                                Log.e(TAG, "❌ Checker registration failed: ${response.code()}")
+                                Log.d(TAG, "✅ Initial checker token registered")
                             }
                         } catch (e: Exception) {
-                            Log.e(TAG, "❌ Failed to register checker", e)
+                            Log.e(TAG, "Failed to register checker", e)
                         }
                     }
 
-                    if (!checkerId.isNullOrBlank() && !userId.isNullOrBlank()) {
+                    if (role == "watcher" && !checkerId.isNullOrBlank()) {
                         try {
                             val response = api.registerWatcher(
-                                request = RegisterWatcherRequest(
+                                RegisterWatcherRequest(
                                     checker_id = checkerId,
                                     watcher_id = userId,
                                     watcher_token = token
                                 )
                             )
                             if (response.isSuccessful) {
-                                Log.d(TAG, "✅ Watcher token registered successfully")
-                            } else {
-                                Log.e(TAG, "❌ Watcher registration failed: ${response.code()}")
+                                Log.d(TAG, "✅ Initial watcher token registered")
                             }
                         } catch (e: Exception) {
-                            Log.e(TAG, "❌ Failed to register watcher", e)
+                            Log.e(TAG, "Failed to register watcher", e)
                         }
                     }
                 }
-            } else {
-                Log.w(TAG, "Fetching FCM registration token failed", task.exception)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to get initial token: ${e.message}", e)
             }
         }
     }
@@ -271,59 +221,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun createNotificationChannels() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-
-            // Normal notifications
-            val defaultSound = android.media.RingtoneManager.getDefaultUri(
-                android.media.RingtoneManager.TYPE_NOTIFICATION
-            )
-            val defaultChannel = NotificationChannel(
-                "checkin_notifications",
-                "Check-in Notifications",
-                NotificationManager.IMPORTANCE_DEFAULT
-            ).apply {
-                description = "Regular updates about check-ins"
-                setSound(defaultSound, null)
-            }
-
-            // Reminder channel
-            val reminderSound = android.media.RingtoneManager.getDefaultUri(
-                android.media.RingtoneManager.TYPE_NOTIFICATION
-            )
-            val reminderChannel = NotificationChannel(
-                "checkin_reminders",
-                "Check-in Reminders",
-                NotificationManager.IMPORTANCE_HIGH
-            ).apply {
-                description = "Reminders for check-ins"
-                setSound(reminderSound, null)
-                enableVibration(true)
-            }
-
-            // Missed check-in alarm channel
-            val alarmSound = android.media.RingtoneManager.getDefaultUri(
-                android.media.RingtoneManager.TYPE_ALARM
-            )
-            val alarmChannel = NotificationChannel(
-                "checkin_alarms",
-                "Missed Check-in Alarms",
-                NotificationManager.IMPORTANCE_HIGH
-            ).apply {
-                description = "Alerts when someone misses a check-in"
-                setSound(alarmSound, null)
-                enableVibration(true)
-            }
-
-            manager.createNotificationChannel(defaultChannel)
-            manager.createNotificationChannel(reminderChannel)
-            manager.createNotificationChannel(alarmChannel)
-        }
-    }
-
     companion object {
-        const val CHANNEL_ID = "checkin_notifications"
         private const val TAG = "MainActivity"
     }
 }

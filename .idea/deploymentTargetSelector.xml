@@ -3,11 +3,11 @@
   <component name="deploymentTargetSelector">
     <selectionStates>
       <SelectionState runConfigName="app">
-        <option name="selectionMode" value="DROPDOWN" />
-        <DropdownSelection timestamp="2025-10-17T17:48:59.987314300Z">
+        <option name="selectionMode" value="DIALOG" />
+        <DropdownSelection timestamp="2025-10-23T12:26:32.967958600Z">
           <Target type="DEFAULT_BOOT">
             <handle>
-              <DeviceId pluginId="LocalEmulator" identifier="path=C:\Users\denni\.android\avd\Watcher_-_Pixel_7_2.avd" />
+              <DeviceId pluginId="LocalEmulator" identifier="path=C:\Users\denni\.android\avd\Pixel_7.avd" />
             </handle>
           </Target>
         </DropdownSelection>
@@ -15,12 +15,12 @@
           <targets>
             <Target type="DEFAULT_BOOT">
               <handle>
-                <DeviceId pluginId="LocalEmulator" identifier="path=C:\Users\denni\.android\avd\Pixel_7.avd" />
+                <DeviceId pluginId="LocalEmulator" identifier="path=C:\Users\denni\.android\avd\CHECKER.avd" />
               </handle>
             </Target>
             <Target type="DEFAULT_BOOT">
               <handle>
-                <DeviceId pluginId="LocalEmulator" identifier="path=C:\Users\denni\.android\avd\Watcher_-_Pixel_7_2.avd" />
+                <DeviceId pluginId="LocalEmulator" identifier="path=C:\Users\denni\.android\avd\WATCHER.avd" />
               </handle>
             </Target>
           </targets>

@@ -21,10 +21,16 @@ data class CheckinRequest(
     val checker_id: String,
     val timestamp: Long? = null,
     val check_interval: Float? = 1f,  // in minutes
-    val check_window: Float? = 0.5f   // in minutes
+    val check_window: Float? = 0.5f,   // in minutes
+    val pulse: String? = null,
+    val blood_pressure: String? = null
 )
 
 data class SleepRequest(
+    val checker_id: String
+)
+
+data class EmergencyRequest(
     val checker_id: String
 )
 
@@ -40,7 +46,12 @@ data class StatusResponse(
     val check_interval: Float?,
     val check_window: Float?,
     val sleeping: Boolean?,
-    val watchers: List<String>
+    val alarm_active: Boolean?,
+    val watchers: List<String>,
+    val pulse: String?,
+    val blood_pressure: String?,
+    val emergency: Boolean?,
+    val last_health_checkin: Long?
 )
 
 data class AcknowledgeAlarmRequest(
@@ -67,6 +78,11 @@ interface ApiService {
     suspend fun sleep(
         @Body request: SleepRequest
     ): Response<ApiResponse>
+
+    @POST("emergency")
+    suspend fun emergency(
+        @Body request: EmergencyRequest
+    ): Response<Map<String, Any>>
 
     @POST("/acknowledge_alarm")
     suspend fun acknowledgeAlarm(

@@ -1,348 +1,262 @@
 package com.dohnezeit.checkinapp
 
-import android.app.NotificationManager
-import android.app.PendingIntent
-import android.content.Context
-import android.content.Intent
-import android.os.Build
-import android.util.Log
-import androidx.core.app.NotificationCompat
 import android.app.AlertDialog
-import android.media.AudioAttributes
-import android.media.MediaPlayer
+import android.app.NotificationManager
+import android.content.Context
+import android.os.Handler
+import android.os.Looper
+import android.os.PowerManager
+import android.util.Log
+import androidx.appcompat.app.AppCompatActivity
 import com.google.firebase.messaging.FirebaseMessagingService
 import com.google.firebase.messaging.RemoteMessage
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
-import android.media.RingtoneManager
-import android.net.Uri
-import android.os.PowerManager
-import androidx.appcompat.app.AppCompatActivity
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.firstOrNull
+import kotlinx.coroutines.launch
 
 class MyFirebaseMessagingService : FirebaseMessagingService() {
 
+    // Use SupervisorJob to prevent cancellation
+    private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private var wakeLock: PowerManager.WakeLock? = null
+
     init {
-        Log.d(TAG, "🔥 MyFirebaseMessagingService INITIALIZED")
+        Log.d(TAG, "🔥 MyFirebaseMessagingService INITIALIZED at ${System.currentTimeMillis()}")
     }
 
     override fun onCreate() {
         super.onCreate()
-        Log.d(TAG, "🔥 MyFirebaseMessagingService onCreate() called")
+        Log.d(TAG, "🔥🔥🔥 MyFirebaseMessagingService onCreate() called at ${System.currentTimeMillis()}")
+
+        // Create notification channels immediately
+        try {
+            NotificationHelper.createNotificationChannels(this)
+            Log.d(TAG, "✅ Notification channels created")
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Failed to create notification channels", e)
+        }
+
+        // Acquire partial wake lock to keep service alive
+        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+        wakeLock = powerManager.newWakeLock(
+            PowerManager.PARTIAL_WAKE_LOCK,
+            "CheckInApp:FCMServiceLock"
+        )
+        wakeLock?.acquire(10 * 60 * 1000L) // 10 minutes
+        Log.d(TAG, "🔋 WakeLock acquired")
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        Log.d(TAG, "🔥 MyFirebaseMessagingService onDestroy() called")
+        wakeLock?.let {
+            if (it.isHeld) {
+                it.release()
+                Log.d(TAG, "🔋 WakeLock released")
+            }
+        }
     }
 
     override fun onMessageReceived(message: RemoteMessage) {
-        Log.d(TAG, "🔥🔥🔥 MESSAGE RECEIVED 🔥🔥🔥")
-        Log.d(TAG, "From: ${message.from}")
-        Log.d(TAG, "Message ID: ${message.messageId}")
-        Log.d(TAG, "Data payload: ${message.data}")
-        Log.d(TAG, "Notification: ${message.notification}")
+        // Acquire a temporary wake lock for this message
+        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+        val messageWakeLock = powerManager.newWakeLock(
+            PowerManager.PARTIAL_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP,
+            "CheckInApp:FCMMessageWakeLock"
+        )
 
-        val type = message.data["type"] ?: "checkin"
-        val checkerId = message.data["checker_id"] ?: "Unknown"
-        val isAlarmLoop = message.data["alarm_loop"] == "true"
+        try {
+            messageWakeLock.acquire(60_000) // 60 seconds
 
-        Log.d(TAG, "Parsed - type: $type, checkerId: $checkerId, isAlarmLoop: $isAlarmLoop")
+            val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            notificationManager.cancelAll()
+            Log.d(TAG, "🔕 Cleared all previous notifications")
 
-        // Stop alarm sound when check-in is successful
-        if (type == "checkin") {
-            stopAlarmSound()
-        }
+            val timestamp = System.currentTimeMillis()
+            Log.d(TAG, "=".repeat(80))
+            Log.d(TAG, "🔥🔥🔥 MESSAGE RECEIVED at $timestamp 🔥🔥🔥")
+            Log.d(TAG, "From: ${message.from}")
+            Log.d(TAG, "Message ID: ${message.messageId}")
+            Log.d(TAG, "Sent time: ${message.sentTime}")
+            Log.d(TAG, "Priority: ${message.priority}")
+            Log.d(TAG, "Original priority: ${message.originalPriority}")
+            Log.d(TAG, "Data payload: ${message.data}")
+            Log.d(TAG, "Notification: ${message.notification}")
+            Log.d(TAG, "=".repeat(80))
 
-        val title = when (type) {
-            "reminder" -> "Time to check in!"
-            "alarm" -> "CHECK-IN MISSED!"
-            "sleep" -> "Checker asleep 💤"
-            else -> "Check-in successful"
-        }
+            // Store message receipt time for debugging
+            getSharedPreferences("fcm_debug", Context.MODE_PRIVATE)
+                .edit()
+                .putLong("last_message_received", timestamp)
+                .putString("last_message_type", message.data["type"])
+                .putString("last_message_id", message.messageId)
+                .apply()
 
-        val body = when (type) {
-            "reminder" -> "Please check in now"
-            "alarm" -> "$checkerId MISSED CHECK-IN! Tap to acknowledge."
-            "sleep" -> "$checkerId has gone to sleep"
-            else -> "$checkerId checked in!"
-        }
+            val type = message.data["type"] ?: "checkin"
+            Log.d(TAG, "📨 Processing message type: $type")
 
-        Log.d(TAG, "Showing notification: $title - $body")
+            val checkerId = message.data["checker_id"] ?: "Unknown"
+            val checkinTimeMillis = message.data["checkin_time"]?.toLongOrNull()
+            val isEmergency = message.data["emergency"] == "true"
 
-        // Play custom sound based on type
-        if (type == "alarm" && isAlarmLoop) {
-            playAlarmSound()
-        } else {
-            playCustomSound(type)
-        }
+            val formattedTime = checkinTimeMillis?.let {
+                val sdf = java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault())
+                sdf.timeZone = java.util.TimeZone.getDefault()
+                sdf.format(java.util.Date(it))
+            } ?: "Unknown"
 
+            // Notification title
+            val title = when {
+                type == "alarm" && isEmergency -> "🚨 EMERGENCY ALARM!"
+                type == "alarm" -> "⚠️ ALARM: CHECK-IN MISSED!"
+                type == "reminder" -> "Time to check in!"
+                type == "missed" -> "Missed check-in"
+                type == "sleep" -> "Checker asleep 💤"
+                else -> "Check in at $formattedTime"
+            }
 
-        showNotification(type, title, body, checkerId, isAlarmLoop)
+            // Health data
+            val pulse = message.data["pulse"]
+            val bp = message.data["blood_pressure"]
 
-        val activity = CurrentActivityHolder.currentActivity
-        if (activity is AppCompatActivity && !activity.isFinishing) {
-            activity.runOnUiThread {
+            val bodyBuilder = StringBuilder(
+                when {
+                    type == "alarm" && isEmergency -> "⚠️ $checkerId TRIGGERED AN EMERGENCY!"
+                    type == "alarm" -> "$checkerId missed their check-in at $formattedTime! Tap to acknowledge."
+                    type == "reminder" -> "Please check in now"
+                    type == "missed" -> "$checkerId missed their check-in at $formattedTime!"
+                    type == "sleep" -> "$checkerId has gone to sleep at $formattedTime."
+                    else -> "$checkerId checked in!"
+                }
+            )
+
+            // Only append health data for checkins
+            if (type == "checkin" && (!pulse.isNullOrBlank() || !bp.isNullOrBlank())) {
+                bodyBuilder.append(" ")
+                if (!pulse.isNullOrBlank()) bodyBuilder.append("❤️ $pulse")
+                if (!bp.isNullOrBlank()) bodyBuilder.append(" | 🩸 $bp")
+            }
+
+            val body = bodyBuilder.toString()
+            Log.d(TAG, "📢 Showing notification: title='$title', body='$body'")
+
+            // Show notification immediately
+            NotificationHelper.showNotification(this, type, title, body, checkerId)
+            Log.d(TAG, "✅ Notification shown successfully")
+
+            // Try to show in-app dialog if app is open
+            Handler(Looper.getMainLooper()).post {
                 try {
-                    val dialog = AlertDialog.Builder(activity)
-                        .setTitle(title)
-                        .setMessage(body)
-                        .setPositiveButton("OK") { _, _ ->
-                            if (type == "alarm") {
-                                acknowledgeAlarm(checkerId)
+                    val activity = CurrentActivityHolder.currentActivity
+                    if (activity is AppCompatActivity && !activity.isFinishing && !activity.isDestroyed) {
+                        Log.d(TAG, "📱 App is in foreground, showing dialog")
+                        val dialog = AlertDialog.Builder(activity)
+                            .setTitle(title)
+                            .setMessage(body)
+                            .setPositiveButton("OK") { _, _ ->
+                                if (type == "alarm") {
+                                    acknowledgeAlarm(checkerId)
+                                }
                             }
+
+                        if (type == "alarm") {
+                            dialog.setCancelable(false)
                         }
 
-                    if (type == "alarm") {
-                        dialog.setCancelable(false)
+                        dialog.show()
+                    } else {
+                        Log.d(TAG, "📱 App not in foreground or activity not available")
                     }
-
-                    dialog.show()
                 } catch (e: Exception) {
-                    Log.e(TAG, "Failed to show alert dialog: ${e.message}")
+                    Log.e(TAG, "❌ Failed to show alert dialog", e)
                 }
             }
-        } else {
-            Log.d(TAG, "No active AppCompat activity to show dialog")
-        }
-    }
 
-    private fun playCustomSound(type: String) {
-        try {
-            // Get the appropriate sound URI from res/raw folder
-            val soundResId = when (type) {
-                "reminder" -> R.raw.reminder_sound  // Custom reminder sound
-                "checkin" -> R.raw.checkin_sound    // Custom check-in success sound
-                else -> null
-            }
-
-            if (soundResId != null) {
-                val mediaPlayer = MediaPlayer.create(this, soundResId)
-                mediaPlayer?.apply {
-                    setOnCompletionListener { mp ->
-                        mp.release()
-                    }
-                    start()
-                }
-            }
+            Log.d(TAG, "✅ Message processing complete")
         } catch (e: Exception) {
-            Log.e(TAG, "Error playing custom sound: ${e.message}")
-        }
-    }
-
-    private fun playAlarmSound() {
-        try {
-            // Stop any existing alarm
-            stopAlarmSound()
-
-            // Create MediaPlayer with custom alarm sound
-            currentAlarmPlayer = MediaPlayer.create(this, R.raw.alarm_sound).apply {
-                isLooping = false  // Don't loop in MediaPlayer, we'll get new notifications
-                setAudioAttributes(
-                    AudioAttributes.Builder()
-                        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                        .setUsage(AudioAttributes.USAGE_ALARM)
-                        .build()
+            Log.e(TAG, "❌ CRITICAL ERROR processing FCM message", e)
+            // Try to show error notification
+            try {
+                NotificationHelper.showNotification(
+                    this,
+                    "checkin",
+                    "Error",
+                    "Failed to process notification: ${e.message}",
+                    "error"
                 )
-                setVolume(1.0f, 1.0f)
-
-                // Acquire wake lock to ensure sound plays even when screen is off
-                val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
-                wakeLock = powerManager.newWakeLock(
-                    PowerManager.PARTIAL_WAKE_LOCK,
-                    "CheckinApp::AlarmWakeLock"
-                ).apply {
-                    acquire(60000) // 60 seconds max
-                }
-
-                setOnCompletionListener { mp ->
-                    Log.d(TAG, "Alarm sound completed")
-                }
-
-                start()
-                Log.d(TAG, "Alarm sound started")
+            } catch (ne: Exception) {
+                Log.e(TAG, "❌ Failed to show error notification", ne)
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error playing alarm sound: ${e.message}", e)
-        }
-    }
-
-    private fun stopAlarmSound() {
-        try {
-            currentAlarmPlayer?.apply {
-                if (isPlaying) {
-                    stop()
-                }
-                release()
+        } finally {
+            if (messageWakeLock.isHeld) {
+                messageWakeLock.release()
+                Log.d(TAG, "🔋 Message WakeLock released")
             }
-            currentAlarmPlayer = null
-
-            wakeLock?.apply {
-                if (isHeld) {
-                    release()
-                }
-            }
-            wakeLock = null
-
-            Log.d(TAG, "Alarm sound stopped")
-        } catch (e: Exception) {
-            Log.e(TAG, "Error stopping alarm: ${e.message}")
         }
     }
 
     private fun acknowledgeAlarm(checkerId: String) {
-        stopAlarmSound()
-
-        CoroutineScope(Dispatchers.IO).launch {
+        Log.d(TAG, "🔔 Acknowledging alarm for $checkerId")
+        serviceScope.launch {
             try {
                 val prefs = PreferencesManager(this@MyFirebaseMessagingService)
                 val apiKey = prefs.apiKey.firstOrNull()
 
-                if (!apiKey.isNullOrEmpty()) {
-                    RetrofitClient.setApiKey(apiKey)
-                    val api = RetrofitClient.create()
-                    api.acknowledgeAlarm(AcknowledgeAlarmRequest(checkerId))
-                    Log.d(TAG, "Alarm acknowledged for $checkerId")
+                if (apiKey.isNullOrEmpty()) {
+                    Log.e(TAG, "❌ Cannot acknowledge alarm: API key not found")
+                    return@launch
+                }
+
+                RetrofitClient.setApiKey(apiKey)
+                val api = RetrofitClient.create()
+                val response = api.acknowledgeAlarm(AcknowledgeAlarmRequest(checkerId))
+
+                if (response.isSuccessful) {
+                    Log.d(TAG, "✅ Alarm acknowledged for $checkerId")
+
+                    // Clear notification on main thread
+                    launch(Dispatchers.Main) {
+                        NotificationHelper.clearNotification(
+                            this@MyFirebaseMessagingService,
+                            "alarm"
+                        )
+                    }
+                } else {
+                    Log.e(TAG, "❌ Failed to acknowledge alarm: ${response.code()}")
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to acknowledge alarm: ${e.message}", e)
+                Log.e(TAG, "❌ Exception acknowledging alarm", e)
             }
         }
-
-        // Clear notification
-        val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        notificationManager.cancel(ALARM_NOTIFICATION_ID)
-    }
-
-    private fun showNotification(type: String, title: String, body: String, checkerId: String, isAlarmLoop: Boolean) {
-        Log.d(TAG, "showNotification called: $type, $title, $body")
-
-        val channelId = when (type) {
-            "alarm" -> "checkin_alarms"
-            "reminder" -> "checkin_reminders"
-            else -> "checkin_notifications"
-        }
-
-        // Alarm notifications are handled via MediaPlayer
-        // Other types use default notification sounds
-        val soundUri = when (type) {
-            "alarm" -> null
-            "reminder" -> Uri.parse("android.resource://${packageName}/${R.raw.reminder_sound}")
-            "checkin" -> Uri.parse("android.resource://${packageName}/${R.raw.checkin_sound}")
-            else -> RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
-        }
-
-        val intent = if (type == "alarm") {
-            // Create intent that acknowledges alarm when tapped
-            Intent(this, MainActivity::class.java).apply {
-                flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
-                putExtra("acknowledge_alarm", true)
-                putExtra("checker_id", checkerId)
-            }
-        } else {
-            Intent(this, MainActivity::class.java).apply {
-                flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
-            }
-        }
-
-        val pendingIntent = PendingIntent.getActivity(
-            this,
-            if (type == "alarm") 1001 else 0,
-            intent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-
-        val builder = NotificationCompat.Builder(this, channelId)
-            .setSmallIcon(android.R.drawable.stat_notify_more)
-            .setContentTitle(title)
-            .setContentText(body)
-            .setPriority(NotificationCompat.PRIORITY_MAX)
-            .setCategory(NotificationCompat.CATEGORY_ALARM)
-            .setContentIntent(pendingIntent)
-            .setAutoCancel(type != "alarm")  // Alarm notifications shouldn't auto-cancel
-            .setOngoing(type == "alarm")  // Make alarm notifications persistent
-
-        // For old devices
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
-            builder.setSound(soundUri)
-        }
-
-        if (soundUri != null) {
-            builder.setSound(soundUri)
-        }
-
-        // Acknowledge action for alarm notifications
-        if (type == "alarm") {
-            val acknowledgeIntent = Intent(this, AlarmAcknowledgeReceiver::class.java).apply {
-                putExtra("checker_id", checkerId)
-            }
-            val acknowledgePendingIntent = PendingIntent.getBroadcast(
-                this,
-                1002,
-                acknowledgeIntent,
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-            )
-            builder.addAction(
-                android.R.drawable.ic_menu_close_clear_cancel,
-                "Acknowledge",
-                acknowledgePendingIntent
-            )
-        }
-
-        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val importance = when (type) {
-                "alarm" -> NotificationManager.IMPORTANCE_HIGH
-                "reminder" -> NotificationManager.IMPORTANCE_HIGH
-                else -> NotificationManager.IMPORTANCE_DEFAULT
-            }
-
-            val channel = android.app.NotificationChannel(
-                channelId,
-                when (type) {
-                    "alarm" -> "Check-in Alarms"
-                    "reminder" -> "Check-in Reminders"
-                    else -> "Check-in Notifications"
-                },
-                importance
-            ).apply {
-                if (soundUri != null) {
-                    setSound(soundUri, AudioAttributes.Builder()
-                        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                        .setUsage(
-                            if (type == "alarm") AudioAttributes.USAGE_ALARM
-                            else AudioAttributes.USAGE_NOTIFICATION
-                        )
-                        .build()
-                    )
-                }
-                enableVibration(true)
-                vibrationPattern = if (type == "alarm") {
-                    longArrayOf(0, 500, 200, 500)
-                } else {
-                    longArrayOf(0, 250, 250, 250)
-                }
-            }
-            manager.createNotificationChannel(channel)
-        }
-
-        // Use fixed ID for alarm notifications so they update instead of stacking
-        val notificationId = when (type) {
-            "alarm" -> ALARM_NOTIFICATION_ID
-            else -> System.currentTimeMillis().toInt()
-        }
-
-        manager.notify(System.currentTimeMillis().toInt(), builder.build())
     }
 
     override fun onNewToken(token: String) {
-        Log.d(TAG, "=== NEW FCM TOKEN === $token")
+        val timestamp = System.currentTimeMillis()
+        Log.d(TAG, "=".repeat(80))
+        Log.d(TAG, "🔄 NEW FCM TOKEN at $timestamp")
+        Log.d(TAG, "Token (first 30 chars): ${token.take(30)}...")
+        Log.d(TAG, "=".repeat(80))
 
-        // Store token locally
-        getSharedPreferences("fcm", Context.MODE_PRIVATE)
-            .edit()
-            .putString("token", token)
-            .apply()
+        // Store token locally immediately
+        try {
+            getSharedPreferences("fcm", Context.MODE_PRIVATE)
+                .edit()
+                .putString("token", token)
+                .putLong("token_timestamp", timestamp)
+                .apply()
+            Log.d(TAG, "✅ Token stored locally")
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Failed to store token locally", e)
+        }
 
-        // Launch coroutine to read preferences and send token
-        CoroutineScope(Dispatchers.IO).launch {
+        // Register with backend
+        serviceScope.launch {
+            // Add a small delay to ensure preferences are ready
+            delay(500)
+
             try {
                 val prefs = PreferencesManager(this@MyFirebaseMessagingService)
                 val userId = prefs.userId.firstOrNull()
@@ -350,32 +264,36 @@ class MyFirebaseMessagingService : FirebaseMessagingService() {
                 val role = prefs.userRole.firstOrNull()
                 val checkerId = prefs.checkerId.firstOrNull()
 
+                Log.d(TAG, "📝 Token registration info: userId=$userId, role=$role, checkerId=$checkerId")
+
                 if (!userId.isNullOrEmpty() && !apiKey.isNullOrEmpty()) {
-                    sendTokenToServer(
-                        token = token,
-                        role = role,
-                        userId = userId,
-                        checkerId = checkerId,
-                        apiKey = apiKey
-                    )
+                    sendTokenToServer(token, role, userId, checkerId, apiKey)
                 } else {
-                    Log.w(TAG, "Cannot send token: missing userId or apiKey")
+                    Log.w(TAG, "⚠️ Cannot send token: missing userId or apiKey")
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to send token in onNewToken: ${e.message}", e)
+                Log.e(TAG, "❌ Failed to send token in onNewToken", e)
             }
         }
     }
 
+    override fun onDeletedMessages() {
+        super.onDeletedMessages()
+        Log.w(TAG, "⚠️ onDeletedMessages() - Some messages were deleted from server before delivery")
+    }
+
+    override fun onMessageSent(msgId: String) {
+        super.onMessageSent(msgId)
+        Log.d(TAG, "📤 onMessageSent: $msgId")
+    }
+
+    override fun onSendError(msgId: String, exception: Exception) {
+        super.onSendError(msgId, exception)
+        Log.e(TAG, "❌ onSendError: $msgId", exception)
+    }
+
     companion object {
-        private const val TAG = "MyFirebaseMsgService"
-        private const val ALARM_NOTIFICATION_ID = 1001
-
-        @Volatile
-        private var currentAlarmPlayer: MediaPlayer? = null
-
-        @Volatile
-        private var wakeLock: PowerManager.WakeLock? = null
+        private const val TAG = "🔥FCM"
 
         fun sendTokenToServer(
             token: String,
@@ -384,26 +302,51 @@ class MyFirebaseMessagingService : FirebaseMessagingService() {
             checkerId: String?,
             apiKey: String?
         ) {
-            if (apiKey.isNullOrEmpty() || userId.isNullOrEmpty()) return
+            Log.d(TAG, "📡 sendTokenToServer called: role=$role, userId=$userId, checkerId=$checkerId")
 
-            CoroutineScope(Dispatchers.IO).launch {
+            if (apiKey.isNullOrEmpty() || userId.isNullOrEmpty()) {
+                Log.e(TAG, "❌ Cannot send token: apiKey or userId is null/empty")
+                return
+            }
+
+            CoroutineScope(Dispatchers.IO + SupervisorJob()).launch {
                 try {
                     RetrofitClient.setApiKey(apiKey)
                     val api = RetrofitClient.create()
 
                     when (role) {
                         "checker" -> {
-                            api.registerChecker(RegisterCheckerRequest(userId, token))
-                        }
-                        "watcher" -> {
-                            if (!checkerId.isNullOrEmpty()) {
-                                api.registerWatcher(RegisterWatcherRequest(checkerId, userId, token))
+                            Log.d(TAG, "📤 Registering CHECKER token...")
+                            val response = api.registerChecker(
+                                RegisterCheckerRequest(userId, token)
+                            )
+                            if (response.isSuccessful) {
+                                Log.d(TAG, "✅ Checker token registered successfully")
+                            } else {
+                                Log.e(TAG, "❌ Checker token registration failed: ${response.code()}")
                             }
                         }
+                        "watcher" -> {
+                            if (checkerId.isNullOrEmpty()) {
+                                Log.e(TAG, "❌ Cannot register watcher: checkerId is null/empty")
+                                return@launch
+                            }
+                            Log.d(TAG, "📤 Registering WATCHER token...")
+                            val response = api.registerWatcher(
+                                RegisterWatcherRequest(checkerId, userId, token)
+                            )
+                            if (response.isSuccessful) {
+                                Log.d(TAG, "✅ Watcher token registered successfully")
+                            } else {
+                                Log.e(TAG, "❌ Watcher token registration failed: ${response.code()}")
+                            }
+                        }
+                        else -> {
+                            Log.w(TAG, "⚠️ Unknown role '$role', skipping token registration")
+                        }
                     }
-                    Log.d(TAG, "Token registration request sent successfully")
                 } catch (e: Exception) {
-                    Log.e(TAG, "Failed to register token: ${e.message}", e)
+                    Log.e(TAG, "❌ Exception during token registration", e)
                 }
             }
         }
